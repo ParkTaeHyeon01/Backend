@@ -1,3 +1,4 @@
+import json
 from fastapi.staticfiles import StaticFiles
 import matplotlib
 # [중요] GUI가 없는 서버 환경을 위해 백엔드를 'Agg'로 고정 (Tkinter 충돌 방지)
@@ -21,6 +22,8 @@ import pandas as pd
 from PIL import Image
 import numpy as np
 from fastapi.middleware.cors import CORSMiddleware
+import folium
+from folium.plugins import MarkerCluster
 
 
 # --- [환경 및 폰트 설정] ---
@@ -99,6 +102,28 @@ class CampgroundResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class RegionalStatResponse(BaseModel):
+    region: str
+    avgPrice: int
+    count: int
+    visits: int
+    rating: float
+    reviews: int
+
+class CampgroundStatResponse(BaseModel):
+    campground: str
+    price: int
+    visits: int
+
+class SeasonalTrendResponse(BaseModel):
+    month: str
+    일반캠핑: int
+    오토캠핑: int
+    글램핑: int
+    카라반: int
+    
+
+    
 # --- 3. API 엔드포인트 ---
 
 @app.get("/health", tags=["System"])
@@ -441,6 +466,165 @@ async def get_main_visit_trend():
         buf.seek(0)
         plt.close()
         return StreamingResponse(buf, media_type="image/png")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+@app.get("/api/stats/regions", response_model=List[RegionalStatResponse], tags=["Statistics"])
+async def get_regional_statistics():
+    db = SessionLocal()
+    try:
+        # 모든 주요 지역을 포함하도록 쿼리 수정
+        query = text("""
+                SELECT 
+                        CASE 
+                            WHEN address LIKE '서울%' THEN '서울'
+                            WHEN address LIKE '경기%' THEN '경기'
+                            WHEN address LIKE '강원%' THEN '강원'
+                            -- '충남', '충북', '충청'을 모두 포함하도록 수정
+                            WHEN address LIKE '충%' OR address LIKE '대전%' OR address LIKE '세종%' THEN '충청'
+                            -- '전남', '전북', '전라'를 모두 포함하도록 수정
+                            WHEN address LIKE '전%' OR address LIKE '광주%' THEN '전라'
+                            -- '경남', '경북', '경상', '부산', '대구', '울산' 포함
+                            WHEN address LIKE '경%' OR address LIKE '부%' OR address LIKE '대구%' OR address LIKE '울산%' THEN '경상'
+                            WHEN address LIKE '제주%' THEN '제주'
+                            ELSE '기타'
+                        END as region,
+                        COUNT(*) as count,
+                        AVG(price_off_weekday) as avgPrice,
+                        GROUP_CONCAT(camspot_id) as ids
+                    FROM campsites
+                    GROUP BY region
+                    HAVING region != '기타'
+                """)
+        region_rows = db.execute(query).mappings().all()
+        
+        results = []
+        for row in region_rows:
+            # '기타' 지역도 데이터가 있다면 표시하고 싶다면 아래 조건을 제거하세요.
+            if row['region'] == '기타': continue 
+            
+            ids = row['ids'].split(',')
+            total_visits = 0
+            
+            # MongoDB 집계 부분 (기존 로직 유지)
+            cursor = review_collection.find({"camp_id": {"$in": ids}})
+            async for doc in cursor:
+                reviews = doc.get("reviews", [])
+                total_visits += len(reviews)
+                
+            results.append({
+                "region": row['region'],
+                "avgPrice": int(row['avgPrice'] or 0),
+                "count": row['count'],
+                "visits": total_visits,
+                "rating": 4.5, 
+                "reviews": total_visits
+            })
+        return results
+    finally:
+        db.close()
+
+
+@app.get("/api/stats/campgrounds/top", response_model=List[CampgroundStatResponse], tags=["Statistics"])
+async def get_top_campgrounds_stats(limit: int = 5):
+    db = SessionLocal()
+    try:
+        # 가격 정보 가져오기
+        query = text("SELECT camspot_id, name, price_off_weekday FROM campsites LIMIT :limit")
+        camps = db.execute(query, {"limit": limit}).mappings().all()
+        
+        results = []
+        for camp in camps:
+            # MongoDB에서 방문량 조회
+            doc = await review_collection.find_one({"camp_id": str(camp['camspot_id'])})
+            visits = len(doc.get("reviews", [])) if doc else 0
+            
+            results.append({
+                "campground": camp['name'],
+                "price": camp['price_off_weekday'] or 0,
+                "visits": visits
+            })
+        return results
+    finally:
+        db.close()
+
+
+@app.get("/api/stats/seasonal-trend", response_model=List[SeasonalTrendResponse], tags=["Statistics"])
+async def get_seasonal_trend():
+    db = SessionLocal()
+    try:
+        # 1. MariaDB에서 캠핑장별 테마 정보 매핑 데이터 생성
+        # 예: {'1': '글램핑', '2': '오토캠핑', ...}
+        query = text("SELECT camspot_id, theme FROM campsites WHERE theme IS NOT NULL")
+        campsite_themes = {str(row['camspot_id']): row['theme'] for row in db.execute(query).mappings().all()}
+
+        # 2. MongoDB 집계 (월별, 캠핑장별 리뷰 수 추출)
+        # 모든 리뷰를 순회하며 날짜 문자열에서 '월' 정보를 추출합니다.
+        cursor = review_collection.find({}, {"camp_id": 1, "reviews.date": 1})
+        
+        # 결과를 담을 딕셔너리 구조: { "1월": {"일반캠핑": 0, "오토캠핑": 0, ...}, ... }
+        stats = {f"{m}월": {"일반캠핑": 0, "오토캠핑": 0, "글램핑": 0, "카라반": 0} for m in range(1, 13)}
+
+        async for doc in cursor:
+            camp_id = doc.get("camp_id")
+            theme = campsite_themes.get(camp_id)
+            
+            # 유효한 테마이고 리뷰가 있는 경우에만 집계
+            if theme in ["일반캠핑", "오토캠핑", "글램핑", "카라반"] and "reviews" in doc:
+                for r in doc["reviews"]:
+                    match = re.search(r'(\d{1,2})월', r.get('date', ''))
+                    if match:
+                        month_key = f"{int(match.group(1))}월"
+                        stats[month_key][theme] += 1
+
+        # 3. 프론트엔드 형식(List)으로 변환
+        formatted_results = []
+        for month, counts in stats.items():
+            # 데이터가 있는 월만 포함하거나 전체를 포함 (여기서는 전체 1~12월 반환)
+            formatted_results.append({
+                "month": month,
+                **counts
+            })
+            
+        # 월 순서대로 정렬
+        formatted_results.sort(key=lambda x: int(x['month'].replace('월', '')))
+        
+        return formatted_results
+
+    except Exception as e:
+        print(f"Seasonal Trend Error: {e}")
+        raise HTTPException(status_code=500, detail="데이터 집계 중 오류가 발생했습니다.")
+    finally:
+        db.close()
+
+
+@app.get("/api/stats/regions/sentiment-image", tags=["Visualization"])
+async def get_stored_region_sentiment_image():
+    # 파일 경로
+    file_path = "static/charts/region_pos.png"
+    
+    # 파일이 존재하지 않을 경우 에러 처리
+    if not os.path.exists(file_path):
+        raise HTTPException(
+            status_code=404, 
+            detail="차트 이미지가 생성되지 않았습니다. 관리자에게 문의하세요."
+        )
+    
+    # 저장된 파일을 즉시 반환 (매우 빠름)
+    return FileResponse(file_path, media_type="image/png")
+
+@app.get("/api/map/{mode}")
+async def get_static_map(mode: str):
+    # mode는 'density' 또는 'cluster'
+    file_path = f"static/maps/{mode}.html"
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="지도 파일을 찾을 수 없습니다. 생성 스크립트를 실행하세요.")
+        
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            map_html = f.read()
+        return {"map_html": map_html}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
