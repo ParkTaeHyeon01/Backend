@@ -136,15 +136,51 @@ async def health_check():
     except Exception as e:
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
 
-# [1] 캠핑장 목록 조회
+# [1] 캠핑장 목록 조회 개선
 @app.get("/campgrounds", response_model=List[CampgroundResponse], tags=["Campgrounds"])
-async def get_campgrounds(page: int = Query(1, ge=1)):
+async def get_campgrounds(
+    page: int = Query(1, ge=1),
+    search: str = Query(None),
+    region: str = Query(None),
+    status: str = Query(None),  # 상태 필터 추가 (active/inactive/all)
+    sort_by: str = Query("camspot_id"),
+    order: str = Query("asc")
+):
     db = SessionLocal()
     per_page = 50
     offset = (page - 1) * per_page
+    
     try:
-        query = text("SELECT * FROM campsites LIMIT :limit OFFSET :offset")
-        result = db.execute(query, {"limit": per_page, "offset": offset})
+        conditions = []
+        params = {"limit": per_page, "offset": offset}
+
+        # 이름 검색
+        if search:
+            conditions.append("name LIKE :search")
+            params["search"] = f"%{search}%"
+        
+        # 지역 필터
+        if region and region != "all":
+            conditions.append("address LIKE :region")
+            params["region"] = f"{region}%"
+
+        # 상태 필터 (추가)
+        if status and status != "all":
+            status_map = {"active": "운영중", "inactive": "휴업"}
+            db_status = status_map.get(status)
+            if db_status:
+                conditions.append("states = :status")
+                params["status"] = db_status
+
+        where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+        
+        # 정렬 및 쿼리 실행
+        order_dir = "DESC" if order.lower() == "desc" else "ASC"
+        sort_col = {"name": "name", "price": "price_off_weekend"}.get(sort_by, "camspot_id")
+        
+        query_str = f"SELECT * FROM campsites {where_clause} ORDER BY {sort_col} {order_dir} LIMIT :limit OFFSET :offset"
+        
+        result = db.execute(text(query_str), params)
         return [dict(row._mapping) for row in result]
     finally:
         db.close()
@@ -548,68 +584,6 @@ async def get_top_campgrounds_stats(limit: int = 5):
     finally:
         db.close()
 
-
-@app.get("/api/stats/seasonal-trend", response_model=List[SeasonalTrendResponse], tags=["Statistics"])
-async def get_seasonal_trend():
-    db = SessionLocal()
-    try:
-        # 1. MariaDB에서 캠핑장별 테마 정보 매핑 데이터 생성
-        # 예: {'1': '글램핑', '2': '오토캠핑', ...}
-        query = text("SELECT camspot_id, theme FROM campsites WHERE theme IS NOT NULL")
-        campsite_themes = {str(row['camspot_id']): row['theme'] for row in db.execute(query).mappings().all()}
-
-        # 2. MongoDB 집계 (월별, 캠핑장별 리뷰 수 추출)
-        # 모든 리뷰를 순회하며 날짜 문자열에서 '월' 정보를 추출합니다.
-        cursor = review_collection.find({}, {"camp_id": 1, "reviews.date": 1})
-        
-        # 결과를 담을 딕셔너리 구조: { "1월": {"일반캠핑": 0, "오토캠핑": 0, ...}, ... }
-        stats = {f"{m}월": {"일반캠핑": 0, "오토캠핑": 0, "글램핑": 0, "카라반": 0} for m in range(1, 13)}
-
-        async for doc in cursor:
-            camp_id = doc.get("camp_id")
-            theme = campsite_themes.get(camp_id)
-            
-            # 유효한 테마이고 리뷰가 있는 경우에만 집계
-            if theme in ["일반캠핑", "오토캠핑", "글램핑", "카라반"] and "reviews" in doc:
-                for r in doc["reviews"]:
-                    match = re.search(r'(\d{1,2})월', r.get('date', ''))
-                    if match:
-                        month_key = f"{int(match.group(1))}월"
-                        stats[month_key][theme] += 1
-
-        # 3. 프론트엔드 형식(List)으로 변환
-        formatted_results = []
-        for month, counts in stats.items():
-            # 데이터가 있는 월만 포함하거나 전체를 포함 (여기서는 전체 1~12월 반환)
-            formatted_results.append({
-                "month": month,
-                **counts
-            })
-            
-        # 월 순서대로 정렬
-        formatted_results.sort(key=lambda x: int(x['month'].replace('월', '')))
-        
-        return formatted_results
-
-    except Exception as e:
-        print(f"Seasonal Trend Error: {e}")
-        raise HTTPException(status_code=500, detail="데이터 집계 중 오류가 발생했습니다.")
-    finally:
-        db.close()
-
-
-@app.get("/api/stats/regions/sentiment-image", tags=["Visualization"])
-async def get_stored_region_sentiment_image():
-    # 파일 경로
-    file_path = "static/charts/region_pos.png"
-    
-    # 파일이 존재하지 않을 경우 에러 처리
-    if not os.path.exists(file_path):
-        raise HTTPException(
-            status_code=404, 
-            detail="차트 이미지가 생성되지 않았습니다. 관리자에게 문의하세요."
-        )
-    
     # 저장된 파일을 즉시 반환 (매우 빠름)
     return FileResponse(file_path, media_type="image/png")
 
@@ -627,6 +601,23 @@ async def get_static_map(mode: str):
         return {"map_html": map_html}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+@app.get("/api/stats/{category}/sentiment-image", tags=["Visualization"])
+async def get_sentiment_image(
+    category: str, # 'regions' 또는 'seasonal'
+    sentiment: str = Query(..., description="'pos' 또는 'neg'")
+):
+    # 파일명 매핑 규칙 설정
+    prefix = "region" if category == "regions" else "seasonal"
+    filename = f"{prefix}_{sentiment.lower()}.png"
+    file_path = f"static/charts/{filename}"
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="차트를 찾을 수 없습니다.")
+        
+    return FileResponse(file_path, media_type="image/png")
+    
 
 
 async def generate_sentiment_wordcloud(camp_id: int, target_sentiment: int):
